@@ -27,13 +27,26 @@ in vec2 p; out vec2 uv;
 void main(){ uv = p * .5 + .5; gl_Position = vec4(p, 0., 1.); }`;
 const FS_ACC = `#version 300 es
 precision highp float; in vec2 uv; out vec4 o;
-uniform sampler2D cur, prev; uniform float a;
-void main(){ o = vec4(mix(texture(prev, uv).rgb, texture(cur, uv).rgb, a), 1.); }`;
+uniform sampler2D cur, prev; uniform float a, g; uniform vec2 px;
+vec3 soft(sampler2D s){
+  return (texture(s, uv).rgb * 2. + texture(s, uv + vec2(px.x, 0.) * 1.5).rgb + texture(s, uv - vec2(px.x, 0.) * 1.5).rgb
+    + texture(s, uv + vec2(0., px.y) * 1.5).rgb + texture(s, uv - vec2(0., px.y) * 1.5).rgb) / 6.;
+}
+void main(){
+  vec3 c = texture(cur, uv).rgb, q = texture(prev, uv).rgb;
+  // Donde algo se mueve se usa el fotograma nuevo: sin estelas ni bordes borrosos.
+  float moved = smoothstep(.10, .30, length(soft(cur) - soft(prev)) * g);
+  o = vec4(mix(q, c, mix(a, 1., moved)), 1.);
+}`;
 const FS_OUT = `#version 300 es
 precision highp float; in vec2 uv; out vec4 o;
-uniform sampler2D t; uniform float g, green;
+uniform sampler2D t; uniform float g, green, sharp; uniform vec2 px;
 void main(){
   vec3 c = texture(t, uv).rgb;
+  // Máscara de enfoque: realza bordes y texto sobre la imagen ya limpia de ruido.
+  vec3 blur = (texture(t, uv + vec2(px.x, 0.)).rgb + texture(t, uv - vec2(px.x, 0.)).rgb
+    + texture(t, uv + vec2(0., px.y)).rgb + texture(t, uv - vec2(0., px.y)).rgb) * .25;
+  c = max(c + (c - blur) * sharp, 0.);
   c = c * g / (1. + c * (g - 1.));
   float l = dot(c, vec3(.299, .587, .114));
   o = vec4(mix(c, vec3(.16, 1., .32) * l, green), 1.);
@@ -110,7 +123,7 @@ function render() {
     return;
   }
   // Más amplificación => más fotogramas promediados (menos ruido, algo más de estela).
-  let a = Math.min(1, Math.max(floatTargets ? 0.12 : 0.5, 1 / (g * 0.8)));
+  let a = Math.min(1, Math.max(floatTargets ? 0.08 : 0.5, 1 / (g * 0.8)));
   if (state.firstFrame) { a = 1; state.firstFrame = false; }
   gl.viewport(0, 0, w, h);
 
@@ -124,6 +137,8 @@ function render() {
   gl.uniform1i(gl.getUniformLocation(progAcc, 'cur'), 0);
   gl.uniform1i(gl.getUniformLocation(progAcc, 'prev'), 1);
   gl.uniform1f(gl.getUniformLocation(progAcc, 'a'), a);
+  gl.uniform1f(gl.getUniformLocation(progAcc, 'g'), g);
+  gl.uniform2f(gl.getUniformLocation(progAcc, 'px'), 1 / w, 1 / h);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   flip = 1 - flip;
 
@@ -133,6 +148,8 @@ function render() {
   gl.useProgram(progOut);
   gl.uniform1i(gl.getUniformLocation(progOut, 't'), 0);
   gl.uniform1f(gl.getUniformLocation(progOut, 'g'), g);
+  gl.uniform1f(gl.getUniformLocation(progOut, 'sharp'), 0.8);
+  gl.uniform2f(gl.getUniformLocation(progOut, 'px'), 1 / w, 1 / h);
   gl.uniform1f(gl.getUniformLocation(progOut, 'green'), state.green ? 1 : 0);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
@@ -153,7 +170,7 @@ function measure() {
   for (let i = 0; i < d.length; i += 4) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
   const mean = sum / (d.length / 4) / 255;
   if (state.auto) {
-    const target = Math.min(10, Math.max(1, 0.42 / Math.max(mean, 0.01)));
+    const target = Math.min(16, Math.max(1, 0.42 / Math.max(mean, 0.01)));
     state.gain += (target - state.gain) * 0.35;
     if (state.gain < 1.08) state.gain = 1;
     $('gain').value = state.gain;
@@ -174,7 +191,8 @@ function boostSensor() {
 function updateStatus() {
   if (state.recorder) return;
   statusEl.classList.remove('rec');
-  statusEl.textContent = state.gain > 1.05 ? `Noche ×${state.gain.toFixed(1)}` : 'Luz normal';
+  const res = Math.min(video.videoWidth, video.videoHeight);
+  statusEl.textContent = (state.gain > 1.05 ? `Noche ×${state.gain.toFixed(1)}` : 'Luz normal') + (res ? ` · ${res}p` : '');
 }
 
 /* ---------- Cámara ---------- */
@@ -184,7 +202,7 @@ async function startCamera() {
     return showError('Este navegador no da acceso a la cámara. Abre la app con https:// en Chrome o Safari.');
   }
   stopCamera();
-  const v = { facingMode: { ideal: state.facing }, width: { ideal: 1920 }, height: { ideal: 1080 } };
+  const v = { facingMode: { ideal: state.facing }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
   try {
     try { state.stream = await navigator.mediaDevices.getUserMedia({ video: v, audio: true }); }
     catch (e) {
@@ -202,6 +220,10 @@ async function startCamera() {
   canvas.classList.toggle('mirror', state.facing === 'user');
   const track = state.stream.getVideoTracks()[0];
   const caps = track.getCapabilities ? track.getCapabilities() : {};
+  // Enfoque continuo para que la imagen no quede blanda.
+  if (caps.focusMode && caps.focusMode.includes('continuous')) track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
+  const st = track.getSettings ? track.getSettings() : {};
+  if (st.width && Math.min(st.width, st.height) < 1080) toast(`Esta cámara solo entrega ${st.width}×${st.height}, no Full HD.`);
   $('torch').disabled = !caps.torch;
   $('torch').setAttribute('aria-pressed', 'false');
   if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {});
@@ -266,7 +288,7 @@ function takePhoto() {
   if (!canvas.width) return;
   render();
   $('flash').classList.remove('on'); void $('flash').offsetWidth; $('flash').classList.add('on');
-  canvas.toBlob((blob) => blob && saveCapture(blob, 'jpg'), 'image/jpeg', 0.95);
+  canvas.toBlob((blob) => blob && saveCapture(blob, 'jpg'), 'image/jpeg', 0.97);
 }
 
 /* ---------- Video ---------- */
@@ -276,7 +298,7 @@ function startRecording() {
   const mime = MIMES.find((m) => MediaRecorder.isTypeSupported(m)) || '';
   const out = new MediaStream([...canvas.captureStream(30).getVideoTracks(), ...state.stream.getAudioTracks()]);
   let rec;
-  try { rec = new MediaRecorder(out, { mimeType: mime || undefined, videoBitsPerSecond: 8e6 }); }
+  try { rec = new MediaRecorder(out, { mimeType: mime || undefined, videoBitsPerSecond: 16e6 }); }
   catch (e) { return toast('No se pudo iniciar la grabación.'); }
   state.chunks = [];
   rec.ondataavailable = (e) => e.data.size && state.chunks.push(e.data);

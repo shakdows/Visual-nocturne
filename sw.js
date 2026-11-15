@@ -1,5 +1,5 @@
 // Permite abrir la app sin conexión: sirve desde caché y actualiza en segundo plano.
-const CACHE = 'visual-nocturne-v1';
+const CACHE = 'visual-nocturne-v2';
 const FILES = ['./', 'index.html', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', (e) => {
